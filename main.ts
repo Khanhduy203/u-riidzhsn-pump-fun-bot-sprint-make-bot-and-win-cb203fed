@@ -204,10 +204,35 @@ class Bot {
     } catch {
       orders = [];
     }
-    // Hard safety net: never exceed the per-reply order cap the protocol allows.
+    // Hard safety nets: the protocol fails the run if a reply carries more
+    // than replyOrderCap(hello) orders OR more than 64 KiB on one line
+    // (MAX_BOT_LINE_BYTES; parseBotLine rejects an over-long line outright).
+    // The count net alone is not enough: hello is read at runtime, and with
+    // a large max_orders_per_batch decide() may emit hundreds of orders
+    // whose JSON exceeds 64 KiB even though the count is legal. Trim from
+    // the end (entries are last, exits first) and roll back the pending
+    // bookkeeping of any dropped order, so its mint is not left thinking an
+    // order is in flight that will never resolve.
     const cap = Math.max(64, 4 * this.cfg.maxOrdersPerBatch);
-    if (orders.length > cap) orders = orders.slice(0, cap);
-    return { type: 'reply', seq, orders };
+    const drop = (o: any): void => {
+      const p = this.pending.get(o.client_id);
+      if (!p) return;
+      const m = this.mints.get(p.mint);
+      if (m) {
+        if (p.side === 'buy') m.pendingBuy = false;
+        else m.pendingSell = false;
+      }
+      this.pending.delete(o.client_id);
+    };
+    while (orders.length > cap) drop(orders.pop());
+    const MAX_LINE_BYTES = 65_536;
+    const enc = new TextEncoder();
+    let reply = { type: 'reply', seq, orders };
+    while (orders.length > 0 && enc.encode(JSON.stringify(reply)).byteLength > MAX_LINE_BYTES) {
+      drop(orders.pop());
+      reply = { type: 'reply', seq, orders };
+    }
+    return reply;
   }
 
   applyFills(fills: any[]): void {
