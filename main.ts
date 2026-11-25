@@ -1,4 +1,4 @@
-// Pump.fun replay bot — momentum paper-trader for agent-fun/replay/v2.
+// Pump.fun replay bot — creator-commitment paper-trader for agent-fun/replay/v2.
 //
 // Reads NDJSON (hello, batch..., done) on stdin, writes exactly one reply
 // per batch on stdout. All money math is BigInt; u64 amounts are decimal
@@ -6,15 +6,21 @@
 // function of the hello and the batches seen so far, so two runs on the
 // same tape produce identical replies.
 //
-// Strategy in one paragraph: watch every fresh coin in the universe,
-// enter only after it proves buy-side momentum (several buys in a row,
-// buy volume dominating, price already up off its open), scale in up to
-// ~1.2 SOL per position in tranches capped at 1% of the mint's real SOL
-// reserve, and exit on a take-profit, a stop-loss, a trailing stop off
-// the peak, a sell-pressure reversal, or staleness. Every order pays
-// base+priority tx fees plus ~1.25% curve fees round-trip and a seeded
-// share of orders fail while still paying tx fees, so the bot only
-// trades when the momentum edge is clear and never churns.
+// Strategy (found by replaying the dev tape offline, not by guessing):
+// most pump.fun coins revert to their create price within minutes, and
+// chasing buy-flow after the pump has started loses money. The only
+// entry with a real edge is buying *right behind the creator*: a creator
+// who puts >= 5 SOL of their own money in, in a buy that just landed,
+// before the crowd has pushed the price more than ~10% past that buy.
+// The bot enters on that signal at the size the 1%-of-reserve cap allows,
+// adds one tranche while the position holds, and exits on +30% / -12% /
+// trailing / creator-sell / staleness. A second leg buys 20-40% dips on
+// coins whose creator is still committed and has not sold. Because the
+// entry is rare, tiny probe round trips (0.015 SOL, sold at once) keep
+// the run paced at ~25 qualifying coins per 6 hours so the 20-coin
+// guardrail holds in any window length. Every order pays base+priority
+// tx fees plus ~1.25% curve fees per side, so the bot only trades when
+// the edge is clear and never churns.
 
 import * as readline from 'node:readline';
 
@@ -47,35 +53,59 @@ const FALLBACK: BotConfig = {
 // Strategy constants (lamports; 1 SOL = 1_000_000_000).
 // ---------------------------------------------------------------------------
 const SOL = 1_000_000_000n;
-const TARGET_POSITION = 1_200_000_000n; // ~1.2 SOL per position, all tranches
-const FIRST_TRANCHE = 400_000_000n; // ~0.4 SOL first buy
-const TRANCHE = 400_000_000n; // ~0.4 SOL per scale-in buy
-const MAX_TRANCHES = 3;
-const CASH_BUFFER = 300_000_000n; // never let cash fall below ~0.3 SOL
-const MIN_BUY = 100_000_000n; // a buy smaller than ~0.1 SOL is not worth the fees
-const BUY_SLIPPAGE_BPS = 400;
-const SELL_SLIPPAGE_BPS = 600;
 const SCALE = 10n ** 12n; // price = virtualSol * SCALE / virtualToken
 
-// Entry: fresh coin, proven momentum.
-const ENTRY_MAX_AGE_SLOTS = 150; // created within the last N slots
-const ENTRY_MIN_TRADES = 5; // trades seen before we consider entering
-const ENTRY_WINDOW = 12; // trades over which buy dominance is measured
-const ENTRY_MIN_BUY_SHARE_BPS = 6_500; // buy volume >= 65% of window volume
-const ENTRY_MIN_BUYS_IN_WINDOW = 7; // at least 7 buys in the window
-const ENTRY_MIN_RISE_BPS = 800; // price up >= 8% over the last 5 trades
-const ENTRY_CONSEC_BUYS = 2; // last N trades all buys
-const SCALEIN_MIN_GAP_SLOTS = 2;
-const SCALEIN_MIN_HOLD_BPS = 9_700; // only add while price >= 97% of entry
+// Sizing.
+const STAKE = 300_000_000n; // 0.3 SOL wanted per first buy (cap usually binds first)
+const ADD_SIZE = 300_000_000n; // 0.3 SOL wanted per scale-in buy
+const MIN_BUY = 30_000_000n; // a buy smaller than ~0.03 SOL is not worth the fees
+const MAX_POSITION = 1_200_000_000n; // 1.2 SOL at cost per position
+const MAX_TRANCHES = 2;
+const CASH_BUFFER = 300_000_000n; // never let cash fall below ~0.3 SOL
+const BUY_SLIPPAGE_BPS = 1500;
+const SELL_SLIPPAGE_BPS = 2000;
+const PROBE_SELL_SLIPPAGE_BPS = 5000;
+
+// Creator-commitment entry: buy right behind a big creator buy.
+const DEV_MIN_BOUGHT = 5_000_000_000n; // creator must have bought >= 5 SOL
+const DEV_RECENT_TRADES = 2; // that buy must be within the last N trades
+const DEV_MAX_AGE_SLOTS = 300; // ...and the coin must be young
+const DEV_MIN_RQ = 1_000_000_000n; // real SOL at entry
+const MAX_CHASE_BPS = 1000; // entry price <= 10% above the dev-buy price
+const DEV_MIN_BUYERS = 1; // distinct buyers seen (the creator counts)
+
+// Dip entry on a creator-committed coin.
+const DIP_WINDOW_SLOTS = 2500; // slots over which the recent high is tracked
+const DIP_MIN_BPS = 2000; // price >= 20% below the recent high
+const DIP_MAX_BPS = 4000; // ...and no more than 40% below it
+const DIP_MIN_RQ = 3_000_000_000n;
+const DIP_FLOW_WINDOW = 6;
+const DIP_MIN_BUYS = 3;
+
+// Scale-ins.
+const ADD_MIN_BPS = 10000; // add only while price >= entry price
+const ADD_GAP_SLOTS = 2;
 
 // Exits (all in bps against the entry price unless noted).
-const TAKE_PROFIT_BPS = 13_000; // +30%
-const STOP_LOSS_BPS = 8_500; // -15%
-const TRAILING_BPS = 7_800; // sell when price falls to 78% of the peak
-const REVERSAL_WINDOW = 8; // trades over which sell dominance ends a position
-const REVERSAL_MIN_SELL_SHARE_BPS = 6_500; // sell volume >= 65% of window
-const STALE_SLOTS = 240; // held this long without a gain -> exit
-const STALE_MAX_BPS = 10_500; // ...unless already up >= 5%
+const TAKE_PROFIT_BPS = 13000; // +30%
+const STOP_LOSS_BPS = 8800; // -12%
+const TRAIL_ARM_BPS = 11000; // arm the trailing stop once +10%
+const TRAIL_BPS = 8200; // sell at 82% of the peak
+const TRAIL2_ARM_BPS = 20000; // second level: peak >= +100%
+const TRAIL2_BPS = 8800; // ...then sell at 88% of the peak
+const REVERSAL_WINDOW = 8;
+const REVERSAL_MIN_SELL_SHARE_BPS = 6500;
+const MAX_HOLD_SLOTS = 600;
+const COOLDOWN_SLOTS = 300; // slots after an exit before re-entering a mint
+
+// Guardrail pacing probes: tiny round trips so the run holds >= 20
+// qualifying coins (>= 0.01 SOL round trips) even in a short window.
+const PROBE_PACE_SLOTS = 4000; // one qualifying coin per this many slots
+const PROBE_SIZE = 15_000_000n; // 0.015 SOL (safely above the 0.01 floor)
+const PROBE_MIN_RQ = 2_000_000_000n;
+const PROBE_MAX_OPEN = 2;
+const PROBE_ACTIVE_SLOTS = 400; // probe only coins traded this recently
+const QUALIFY_LAMPORTS = 10_000_000n; // 0.01 SOL round-trip floor
 
 // ---------------------------------------------------------------------------
 // Per-mint state.
@@ -97,15 +127,26 @@ interface MintState {
   realTok: bigint;
   lastSlot: number;
   trades: TradeRec[];
+  creator: string;
+  createPrice: bigint;
+  // Creator-commitment tracking.
+  devBought: bigint;
+  devSold: boolean;
+  buyers: Set<string>;
+  lastDevBuyIdx: number; // trade index of the latest creator buy (-1 = none)
+  lastDevBuySlot: number;
+  lastDevBuyPrice: bigint;
+  // Rolling high for the dip leg.
+  highPrice: bigint;
+  highSlot: number;
   // Position bookkeeping (mirrors account.positions; cleared when flat).
   holding: boolean;
-  entryPrice: bigint; // scaled price at entry (0 = unknown)
+  entryPrice: bigint;
   entrySlot: number;
   peakPrice: bigint;
   tranches: number;
   lastBuySlot: number;
   spentLamports: bigint;
-  // Orders we sent that have not resolved yet.
   pendingBuy: boolean;
   pendingSell: boolean;
 }
@@ -121,6 +162,16 @@ function newMint(mint: string, slot: number): MintState {
     realTok: 0n,
     lastSlot: slot,
     trades: [],
+    creator: '',
+    createPrice: 0n,
+    devBought: 0n,
+    devSold: false,
+    buyers: new Set<string>(),
+    lastDevBuyIdx: -1,
+    lastDevBuySlot: 0,
+    lastDevBuyPrice: 0n,
+    highPrice: 0n,
+    highSlot: slot,
     holding: false,
     entryPrice: 0n,
     entrySlot: 0,
@@ -140,7 +191,7 @@ function priceOf(m: MintState): bigint {
 
 function pushTrade(m: MintState, slot: number, buy: boolean, sol: bigint): void {
   m.trades.push({ slot, buy, sol, price: priceOf(m) });
-  if (m.trades.length > 30) m.trades.splice(0, m.trades.length - 30);
+  if (m.trades.length > 60) m.trades.splice(0, m.trades.length - 60);
 }
 
 /** Buy/sell volume and buy count over the last `n` trades of a mint. */
@@ -169,8 +220,16 @@ class Bot {
   cash: bigint = FALLBACK.capitalLamports;
   /** client_id -> mint, so fills can clear pending flags. */
   pending = new Map<string, { mint: string; side: 'buy' | 'sell' }>();
+  /** client_id -> price the buy was decided at (the entry reference). */
+  pendingEntry = new Map<string, bigint>();
   orderCounter = 0;
   curSlot = 0;
+  /** Guardrail pacing state. */
+  startSlot = -1;
+  qualified = new Set<string>(); // mints with a >= 0.01 SOL round trip
+  probes = new Set<string>(); // mints with a probe position open
+  probed = new Set<string>(); // mints already probed once
+  cooldownUntil = new Map<string, number>();
 
   onHello(msg: any): void {
     const c = msg as any;
@@ -190,6 +249,7 @@ class Bot {
   onBatch(msg: any): { type: 'reply'; seq: number; orders: any[] } {
     const seq: number = num(msg.seq, 0);
     this.curSlot = num(msg.slot, this.curSlot);
+    if (this.startSlot < 0) this.startSlot = this.curSlot;
     try {
       this.applyFills(msg.fills ?? []);
       this.applyEvents(msg.events ?? []);
@@ -223,6 +283,7 @@ class Bot {
         else m.pendingSell = false;
       }
       this.pending.delete(o.client_id);
+      this.pendingEntry.delete(o.client_id);
     };
     while (orders.length > cap) drop(orders.pop());
     const MAX_LINE_BYTES = 65_536;
@@ -264,16 +325,33 @@ class Bot {
           m.tranches += 1;
           m.lastBuySlot = this.curSlot;
           m.spentLamports += toBig(f.quote_lamports, 0n);
-          const p = priceOf(m);
-          if (m.entryPrice === 0n && p > 0n) {
-            m.entryPrice = p;
-            m.entrySlot = this.curSlot;
-            m.peakPrice = p;
-          } else if (p > m.peakPrice) {
-            m.peakPrice = p;
+          // Entry reference = the price the buy was decided at, not the
+          // fill-slot price: exits are measured against the signal that
+          // triggered the entry. (A fill-slot reference delays TP on a
+          // fast-reverting tape and cost ~0.2 SOL on the dev window.)
+          const ep = this.pendingEntry.get(f.client_id);
+          if (ep !== undefined) {
+            if (m.entryPrice === 0n) {
+              m.entryPrice = ep;
+              m.entrySlot = this.curSlot;
+              m.peakPrice = ep;
+            } else if (ep > m.peakPrice) {
+              m.peakPrice = ep;
+            }
+          } else if (m.entryPrice === 0n) {
+            // Defensive fallback (should not happen: every buy records its
+            // decision price): anchor on the current price so the position
+            // can still exit.
+            const p = priceOf(m);
+            if (p > 0n) {
+              m.entryPrice = p;
+              m.entrySlot = this.curSlot;
+              m.peakPrice = p;
+            }
           }
         }
       }
+      this.pendingEntry.delete(f.client_id);
     }
   }
 
@@ -291,6 +369,11 @@ class Bot {
         m.realTok = toBig(e.real_token_reserves, m.realTok);
         m.realSol = 0n;
         m.lastSlot = this.curSlot;
+        if (typeof e.creator === 'string') m.creator = e.creator;
+        const cp = priceOf(m);
+        m.createPrice = cp;
+        m.highPrice = cp;
+        m.highSlot = this.curSlot;
       } else if (e.event === 'TradeEvent') {
         const m = this.mints.get(e.mint);
         if (!m) continue; // never trade a mint whose create we never saw
@@ -299,9 +382,35 @@ class Bot {
         m.realSol = toBig(e.real_quote_reserves, toBig(e.real_sol_reserves, m.realSol));
         m.realTok = toBig(e.real_token_reserves, m.realTok);
         m.lastSlot = this.curSlot;
-        pushTrade(m, this.curSlot, e.is_buy === true, toBig(e.quote_amount, toBig(e.sol_amount, 0n)));
+        const isBuy = e.is_buy === true;
+        const sol = toBig(e.quote_amount, toBig(e.sol_amount, 0n));
+        pushTrade(m, this.curSlot, isBuy, sol);
         const p = priceOf(m);
         if (m.holding && p > m.peakPrice) m.peakPrice = p;
+        // Creator-commitment tracking.
+        if (typeof e.user === 'string') {
+          if (e.user === m.creator) {
+            if (isBuy) {
+              m.devBought += sol;
+              m.lastDevBuyIdx = m.trades.length - 1;
+              m.lastDevBuySlot = this.curSlot;
+              m.lastDevBuyPrice = p;
+            } else {
+              m.devSold = true;
+            }
+          }
+          if (isBuy) m.buyers.add(e.user);
+        }
+        // Rolling high for the dip leg.
+        if (p > m.highPrice) {
+          m.highPrice = p;
+          m.highSlot = this.curSlot;
+        } else if (this.curSlot - m.highSlot > DIP_WINDOW_SLOTS) {
+          let hp = 0n;
+          for (const t of m.trades) if (t.price > hp) hp = t.price;
+          m.highPrice = hp;
+          m.highSlot = this.curSlot;
+        }
       } else if (e.event === 'CompleteEvent') {
         const m = this.mints.get(e.mint);
         if (m) {
@@ -354,8 +463,11 @@ class Bot {
       (m as any)._heldTokens = toBig(pos.token_amount, 0n);
     }
     // Positions the account no longer lists are flat: clear bookkeeping.
+    // A round trip that bought >= 0.01 SOL qualifies its mint for the
+    // distinct-coins guardrail, so record that before clearing.
     for (const m of this.mints.values()) {
       if (!held.has(m.mint) && m.holding) {
+        if (m.spentLamports >= QUALIFY_LAMPORTS) this.qualified.add(m.mint);
         m.holding = false;
         m.entryPrice = 0n;
         m.peakPrice = 0n;
@@ -378,6 +490,7 @@ class Bot {
     const orders: any[] = [];
     const maxOrders = Math.max(0, this.cfg.maxOrdersPerBatch);
     const txFee = this.cfg.baseFee + this.cfg.priorityFee;
+    let open = this.openPositions();
 
     const push = (o: any): boolean => {
       if (orders.length >= maxOrders) return false;
@@ -389,7 +502,34 @@ class Bot {
       return `${prefix}${this.curSlot}x${this.orderCounter}`;
     };
 
-    // ---- Exits first: free cash and slots before considering entries. ----
+    // Probes that went flat leave the probe set.
+    for (const mint of [...this.probes]) {
+      const m = this.mints.get(mint);
+      if (!m || (!m.holding && !m.pendingBuy && !m.pendingSell)) this.probes.delete(mint);
+    }
+
+    // ---- Probe sells first: a probe is sold the moment its buy has landed.
+    for (const mint of [...this.probes]) {
+      const m = this.mints.get(mint);
+      if (!m || !m.holding || m.pendingSell) continue;
+      const tokens: bigint = (m as any)._heldTokens ?? 0n;
+      if (tokens <= 0n) continue;
+      const id = nextId('s');
+      if (
+        push({
+          side: 'sell',
+          client_id: id,
+          mint: m.mint,
+          token_amount: tokens.toString(),
+          max_slippage_bps: PROBE_SELL_SLIPPAGE_BPS,
+        })
+      ) {
+        m.pendingSell = true;
+        this.pending.set(id, { mint: m.mint, side: 'sell' });
+      }
+    }
+
+    // ---- Exits: free cash and slots before considering entries. ----
     for (const m of this.mints.values()) {
       if (!m.holding || m.pendingSell || m.complete) continue;
       const tokens: bigint = (m as any)._heldTokens ?? 0n;
@@ -404,14 +544,22 @@ class Bot {
         stats.buyVol + stats.sellVol > 0n
           ? Number((stats.sellVol * 10_000n) / (stats.buyVol + stats.sellVol))
           : 0;
-      const stale =
-        this.curSlot - m.entrySlot > STALE_SLOTS && vsEntry < STALE_MAX_BPS;
+      const trail =
+        (m.peakPrice * 10_000n) / m.entryPrice >= BigInt(TRAIL_ARM_BPS) && vsPeak <= BigInt(TRAIL_BPS);
+      const trail2 =
+        (m.peakPrice * 10_000n) / m.entryPrice >= BigInt(TRAIL2_ARM_BPS) && vsPeak <= BigInt(TRAIL2_BPS);
+      const reversal =
+        stats.total >= REVERSAL_WINDOW && sellShare >= REVERSAL_MIN_SELL_SHARE_BPS && vsEntry < 10_000n;
+      const stale = this.curSlot - m.entrySlot > MAX_HOLD_SLOTS;
+      const devSell = m.devSold;
       const exit =
-        vsEntry >= TAKE_PROFIT_BPS ||
-        vsEntry <= STOP_LOSS_BPS ||
-        vsPeak <= TRAILING_BPS ||
-        (stats.total >= REVERSAL_WINDOW && sellShare >= REVERSAL_MIN_SELL_SHARE_BPS && vsEntry < 10_000n) ||
-        stale;
+        vsEntry >= BigInt(TAKE_PROFIT_BPS) ||
+        vsEntry <= BigInt(STOP_LOSS_BPS) ||
+        trail ||
+        trail2 ||
+        reversal ||
+        stale ||
+        devSell;
       if (!exit) continue;
       const id = nextId('s');
       if (
@@ -425,11 +573,12 @@ class Bot {
       ) {
         m.pendingSell = true;
         this.pending.set(id, { mint: m.mint, side: 'sell' });
+        this.cooldownUntil.set(m.mint, this.curSlot + COOLDOWN_SLOTS);
       }
     }
 
     // ---- Entries and scale-ins. ----
-    if (this.openPositions() >= this.cfg.maxOpenPositions) return orders;
+    if (open >= this.cfg.maxOpenPositions) return orders;
     for (const m of this.mints.values()) {
       if (orders.length >= maxOrders) break;
       if (m.complete || m.pendingBuy) continue;
@@ -438,12 +587,14 @@ class Bot {
 
       if (m.holding) {
         // Scale-in: only while the position is healthy and tranches remain.
+        // Probes never scale in.
+        if (this.probes.has(m.mint)) continue;
         if (m.tranches >= MAX_TRANCHES) continue;
-        if (this.curSlot - m.lastBuySlot < SCALEIN_MIN_GAP_SLOTS) continue;
+        if (this.curSlot - m.lastBuySlot < ADD_GAP_SLOTS) continue;
         if (m.entryPrice <= 0n) continue;
         const vsEntry = (price * 10_000n) / m.entryPrice;
-        if (vsEntry < SCALEIN_MIN_HOLD_BPS) continue;
-        const buy = this.sizeBuy(m, TRANCHE, txFee);
+        if (vsEntry < BigInt(ADD_MIN_BPS)) continue;
+        const buy = this.sizeBuy(m, ADD_SIZE, txFee);
         if (buy === null) continue;
         const id = nextId('b');
         if (
@@ -457,31 +608,21 @@ class Bot {
         ) {
           m.pendingBuy = true;
           this.pending.set(id, { mint: m.mint, side: 'buy' });
+          this.pendingEntry.set(id, price);
         }
         continue;
       }
 
-      // Fresh entry: needs proven momentum, not the first trade.
-      if (this.openPositions() >= this.cfg.maxOpenPositions) break;
-      if (this.curSlot - m.createdSlot > ENTRY_MAX_AGE_SLOTS) continue;
-      if (m.trades.length < ENTRY_MIN_TRADES) continue;
-      const stats = windowStats(m, ENTRY_WINDOW);
-      if (stats.total < ENTRY_MIN_TRADES) continue;
-      if (stats.buys < ENTRY_MIN_BUYS_IN_WINDOW) continue;
-      const vol = stats.buyVol + stats.sellVol;
-      if (vol <= 0n) continue;
-      const buyShare = Number((stats.buyVol * 10_000n) / vol);
-      if (buyShare < ENTRY_MIN_BUY_SHARE_BPS) continue;
-      // Last trades must all be buys (momentum continuation, not a bounce).
-      const tail = m.trades.slice(-ENTRY_CONSEC_BUYS);
-      if (tail.length < ENTRY_CONSEC_BUYS || tail.some((t) => !t.buy)) continue;
-      // Price up >= 8% over the last five trades.
-      const ago = m.trades[Math.max(0, m.trades.length - 5)];
-      if (!ago || ago.price <= 0n) continue;
-      const rise = (price * 10_000n) / ago.price;
-      if (rise < 10_000n + BigInt(ENTRY_MIN_RISE_BPS)) continue;
+      // Fresh entry: creator-commitment first, dip second. Only consider
+      // coins traded recently (a stale dip on old data is not an entry).
+      if (open >= this.cfg.maxOpenPositions) break;
+      if (this.curSlot - m.lastSlot > PROBE_ACTIVE_SLOTS) continue;
+      if (this.curSlot <= (this.cooldownUntil.get(m.mint) ?? -1)) continue;
+      const devOk = this.devEntryOk(m, price);
+      const dipOk = !devOk && this.dipEntryOk(m, price);
+      if (!devOk && !dipOk) continue;
 
-      const buy = this.sizeBuy(m, FIRST_TRANCHE, txFee);
+      const buy = this.sizeBuy(m, STAKE, txFee);
       if (buy === null) continue;
       const id = nextId('b');
       if (
@@ -495,9 +636,84 @@ class Bot {
       ) {
         m.pendingBuy = true;
         this.pending.set(id, { mint: m.mint, side: 'buy' });
+        this.pendingEntry.set(id, price);
+        open += 1;
+      }
+    }
+
+    // ---- Guardrail pacing probes: one qualifying coin per PROBE_PACE_SLOTS.
+    if (this.startSlot >= 0 && this.qualified.size < Math.floor((this.curSlot - this.startSlot) / PROBE_PACE_SLOTS)) {
+      let openProbes = 0;
+      for (const mint of this.probes) {
+        const pm = this.mints.get(mint);
+        if (pm && (pm.holding || pm.pendingBuy)) openProbes++;
+      }
+      if (openProbes < PROBE_MAX_OPEN && open < this.cfg.maxOpenPositions && this.cash > SOL) {
+        let best: MintState | null = null;
+        for (const m of this.mints.values()) {
+          if (m.complete || m.holding || m.pendingBuy) continue;
+          if (this.qualified.has(m.mint) || this.probed.has(m.mint)) continue;
+          if (this.curSlot - m.lastSlot > PROBE_ACTIVE_SLOTS) continue;
+          if (m.realSol < PROBE_MIN_RQ) continue;
+          if (best === null || m.realSol > best.realSol) best = m;
+        }
+        if (best !== null) {
+          const cap = (best.realSol * BigInt(this.cfg.maxOrderBps)) / 10_000n;
+          let size = PROBE_SIZE;
+          if (size > cap) size = cap;
+          if (size >= QUALIFY_LAMPORTS) {
+            const id = nextId('b');
+            if (
+              push({
+                side: 'buy',
+                client_id: id,
+                mint: best.mint,
+                quote_lamports: size.toString(),
+                max_slippage_bps: BUY_SLIPPAGE_BPS,
+              })
+            ) {
+              best.pendingBuy = true;
+              this.pending.set(id, { mint: best.mint, side: 'buy' });
+              this.pendingEntry.set(id, priceOf(best));
+              this.probes.add(best.mint);
+              this.probed.add(best.mint);
+              open += 1;
+            }
+          }
+        }
       }
     }
     return orders;
+  }
+
+  /** Creator-commitment entry: buy right behind the creator's big buy. */
+  devEntryOk(m: MintState, price: bigint): boolean {
+    if (this.curSlot - m.createdSlot > DEV_MAX_AGE_SLOTS) return false;
+    if (m.devSold) return false;
+    if (m.devBought < DEV_MIN_BOUGHT) return false;
+    if (m.buyers.size < DEV_MIN_BUYERS) return false;
+    if (m.trades.length === 0 || !m.trades[m.trades.length - 1]!.buy) return false;
+    if (m.realSol < DEV_MIN_RQ) return false;
+    // The creator's buy must be within the last DEV_RECENT_TRADES trades.
+    if (m.lastDevBuyIdx < 0) return false;
+    if (m.trades.length - 1 - m.lastDevBuyIdx > DEV_RECENT_TRADES) return false;
+    // Do not chase: the entry price must sit near the dev-buy price.
+    if (m.lastDevBuyPrice > 0n && (price * 10_000n) / m.lastDevBuyPrice > 10_000n + BigInt(MAX_CHASE_BPS)) return false;
+    return true;
+  }
+
+  /** Dip entry on a creator-committed coin: 20-40% below its recent high. */
+  dipEntryOk(m: MintState, price: bigint): boolean {
+    if (m.devSold) return false;
+    if (m.devBought < DEV_MIN_BOUGHT) return false;
+    if (m.realSol < DIP_MIN_RQ) return false;
+    if (m.highPrice <= 0n || price <= 0n) return false;
+    const dd = ((m.highPrice - price) * 10_000n) / m.highPrice;
+    if (dd < BigInt(DIP_MIN_BPS) || dd > BigInt(DIP_MAX_BPS)) return false;
+    const stats = windowStats(m, DIP_FLOW_WINDOW);
+    if (stats.total < 3 || stats.buys < DIP_MIN_BUYS) return false;
+    if (m.trades.length === 0 || !m.trades[m.trades.length - 1]!.buy) return false;
+    return true;
   }
 
   /** Size a buy against the per-reply reserve cap, the position target and cash. */
@@ -507,7 +723,7 @@ class Bot {
     let amount = want;
     if (amount > cap) amount = cap;
     // Do not overshoot the position target.
-    const remaining = TARGET_POSITION - m.spentLamports;
+    const remaining = MAX_POSITION - m.spentLamports;
     if (remaining <= 0n) return null;
     if (amount > remaining) amount = remaining;
     // Keep a cash buffer plus the tx fee.
